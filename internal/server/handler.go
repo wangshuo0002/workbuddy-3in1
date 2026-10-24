@@ -943,6 +943,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
 	degradedApplied := false
+	// authRefreshed 本次请求是否已因 401 强制刷新过 token（每次请求最多一次，
+	// 防「刷新返回新 token 但上游仍 401」时在同一请求内反复刷新刷上游）。
+	authRefreshed := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
 	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
@@ -1032,9 +1035,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 				lastErr = err
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				switch {
+				case errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead:
 					h.cfg.Pool.Disable(acct.UID, "refresh session dead")
-				} else {
+				case errors.As(err, &ue) && ue.Kind == upstream.ErrUnauthorized:
+					// refresh 端点 401 = refreshToken 也失效（无 12153 标记）。这是
+					// 「知道原因」的终态：token 全死，只能人工重登。禁用而非 NoteError
+					// （NoteError 只熔断 30m，到期后仍拿同一把死 refreshToken 反复送死）。
+					h.cfg.Pool.Disable(acct.UID, "refresh 401 unauthorized (token rejected), re-login required")
+				default:
 					h.cfg.Pool.NoteError(acct.UID)
 				}
 				fail(acct.UID)
@@ -1115,6 +1124,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadRequest
 				st.outcome = reqlog.OutcomeHTTPError
 				return
+			}
+			// 401 凭据被拒（非 12153 session dead）：token 被上游作废/轮换，或 realm 与
+			// base 域不匹配。**先强制刷新 token 并原地重试一次**——这是唯一能自愈的动作，
+			// 换号只会把同一个死 token 问题转嫁给别的请求。刷新成功 → 该号重新入列重试；
+			// 刷新失败（refresh 也被拒）→ 真需人工重登，交 applyErrorPolicy 禁用。
+			// 只试一次（authRefreshed 标记），避免 refresh 返回"新"token 但上游仍 401 时
+			// 在同一请求里反复刷新刷上游。
+			if kind == upstream.ErrUnauthorized && !authRefreshed {
+				authRefreshed = true
+				if rerr := h.cfg.Upstream.RefreshToken(acct); rerr == nil {
+					if serr := acct.SaveAtomic(); serr != nil {
+						log.Printf("ERR: [server] 401 refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), serr)
+					}
+					delete(tried, acct.UID) // 刷新成功：同号值得再试一次
+					releaseHeld()
+					log.Printf("WARN: [server] 401 acct=%s: token force-refreshed, retrying same account", logfmt.Label(acct.UID, acct.Nickname))
+					continue
+				} else {
+					log.Printf("WARN: [server] 401 acct=%s: token refresh failed (%v), disabling", logfmt.Label(acct.UID, acct.Nickname), rerr)
+				}
 			}
 			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
 			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
@@ -1366,6 +1395,10 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrUnauthorized → Disable：401 凭据被上游拒绝。chatCompletions 已先尝试
+//     「强制刷新 token + 原地重试一次」，走到本分支说明刷新失败或刷新后仍 401
+//     （refreshToken 也失效 / 账号被风控）。token 已死，禁用并提示重登；
+//     **不喂连败计数**——这是知道原因的失败，已有终态惩罚，不该重复计罚。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号（同 ErrContentBlocked 待遇），但仍轮转。
 //   - ErrPromptTooLong → 11115：请求的问题不是账号的问题。零动作（不冷却/不熔断/
@@ -1378,6 +1411,8 @@ func rotateBackoff(i int, ctx context.Context) bool {
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
 //     额外喂连败计数（NoteFailures，issue #114）：未知 4xx 连败 N 次临时出池。
+//     注意 401 **不再**落 ErrClient（见 ErrUnauthorized）：凭据被拒是已知原因，
+//     不该被当成「不知道原因的失败」推进连败降权。
 //
 // body 仅在 ErrSoftRate/ErrAccountFault 分支用于解析重置时间/分野；model 为请求
 // 携带的模型名。uerr 是 ChatStreamContext 返回的分类信封（可携带 RetryAfter）；
@@ -1430,6 +1465,16 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+	case upstream.ErrUnauthorized:
+		// 401 凭据被上游拒绝。走到这里只有两种可能：
+		//   1. chatCompletions 已尝试强制刷新 token 且**刷新本身失败**（refresh 也被
+		//      401 → refreshToken 也失效，只能人工重登）；
+		//   2. 刷新成功但重试仍 401（上游不认这把 token，多为账号被风控/封禁）。
+		// 两种都不该留在池里反复被选中——token 已死，继续轮转只会让下一个请求再撞
+		// 一次 401。故禁用并给出可操作原因（面板显示 disabled_reason）。
+		// **不喂连败计数**：这是「知道原因」的失败（凭据问题），已有终态惩罚；
+		// 再喂连败是重复计罚（连败降权的定位是「不知道原因的兜底」）。
+		h.cfg.Pool.Disable(uid, "upstream 401 unauthorized (token rejected), re-login required")
 	case upstream.ErrNotFound:
 		// 404 短冷却（软冷却），防雪崩。固定 notFoundCooldown，不随 soft_rate 退避：
 		// 偶发路径缺失不是限流信号，不该按限流惩罚升级。

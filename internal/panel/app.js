@@ -385,8 +385,11 @@ function renderAccounts(list) {
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (cool > 0) {
       cls = 'cool';
-      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
-        : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
+      // 冷却类别以后端 cool_kind 为准（后端取三者最晚截止并回填类别，含 degraded）。
+      // 前端不再自己比大小推断：后端 cool_remaining_sec 已是 max(until/breaker/degrade)，
+      // 再拿 dg 与它比较会永远为假，把「连败降权」误显示成「限流冷却」。
+      const CK = { breaker: '熔断', degraded: '连败降权', hard_credit: '积分冷却', soft_rate: '限流冷却' };
+      const kind = CK[s.cool_kind] || '限流冷却';
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';

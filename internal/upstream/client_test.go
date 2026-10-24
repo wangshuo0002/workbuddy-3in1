@@ -63,7 +63,16 @@ func TestClassify(t *testing.T) {
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
-		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		{401, `{"code":9999,"msg":"bad token"}`, ErrUnauthorized},
+		// 401 凭据被拒（无 12153 标记）→ ErrUnauthorized，**不得**落 ErrClient。
+		// 现场：上游 APISIX 网关回 openresty 的 "401 Authorization Required" HTML 页，
+		// 旧分类落到通用 4xx 兜底 ErrClient → 喂连败计数 → 5 连败触发连败降权，
+		// 面板显示「连败降权」而真实病因只是 token 被作废（刷一次就好）。
+		{401, `<html><head><title>401 Authorization Required</title></head><body><center><h1>401 Authorization Required</h1></center><hr><center>openresty</center></body></html>`, ErrUnauthorized},
+		{401, ``, ErrUnauthorized},
+		{401, `Unauthorized`, ErrUnauthorized},
+		// 401 上的限流文案不改变「凭据被拒」这一更权威的事实（12153 已在更上层捕获）。
+		{401, `{"msg":"rate limit"}`, ErrUnauthorized},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},

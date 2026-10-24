@@ -91,6 +91,10 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	// 连败降权同属「惩罚状态」：运维点「解冻」就是要无条件恢复可用。漏清会让
+	// 账号明明已复活却仍被降权截止挡在选号之外（面板显示「可用」但请求选不到）。
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
 	p.dirty.Store(true)
 	return true
 }
@@ -523,7 +527,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CreditsExpiring:          e.creditsExpiring,
 		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 		CreditsEarliestRemaining: e.creditsEarliestRemaining,
-		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
+		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil) || now.Before(e.degradeUntil),
 		Reason:                   e.reason,
 		Disabled:                 e.disabled,
 		SuccessCount:             e.successCount,
@@ -547,8 +551,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		// 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，
-		// 取仍在未来且更晚截止的那个，避免仅熔断期时误报 0 / unknown。
+		// 常规冷却（until）/熔断期（breakerUntil）/连败降权（degradeUntil）可能只有
+		// 其一在生效，取仍在未来且最晚的截止，避免仅熔断期/仅降权时误报 0 / unknown。
+		// 连败降权必须计入：healthy() 已把它当不可选条件，状态端口径若漏掉就会出现
+		// 「面板说可用、实际选不到」的裂缝（运维无法解释为什么请求没打到这个号）。
 		remaining := int64(0)
 		if now.Before(e.until) {
 			if r := int64(time.Until(e.until).Seconds() + 0.999); r > remaining {
@@ -561,9 +567,20 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 				st.CoolKind = "breaker"
 			}
 		}
+		if now.Before(e.degradeUntil) {
+			if r := int64(time.Until(e.degradeUntil).Seconds() + 0.999); r > remaining {
+				remaining = r
+				st.CoolKind = "degraded"
+			}
+		}
 		st.CoolRemaining = remaining
 		if st.CoolKind == "" {
 			st.CoolKind = e.coolKind.String()
+		}
+		if st.CoolKind == "degraded" {
+			// 降权原因单独回填（不写进 e.reason）：degradeUntil 不落 reason 字段，
+			// 直接复用会把「连败降权」误标成上一次的冷却原因，且成功后无人清。
+			st.Reason = degradeReason
 		}
 	}
 	return st

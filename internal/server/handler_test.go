@@ -830,6 +830,132 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	}
 }
 
+// TestChat401RefreshesTokenAndRetriesSameAccount 401（凭据被上游网关拒绝，无 12153
+// 标记）必须走「强制刷新 token + 同号重试一次」，而不是直接换号/禁用。
+//
+// 现场回归：上游 APISIX 回 openresty 的 "401 Authorization Required" HTML 页。
+// 旧行为把 401 归 ErrClient → 只换号 + 喂连败计数；连续 5 次就触发连败降权，
+// 面板显示「连败降权」，而真实病因只是 access token 被作废（刷一次即好）。
+func TestChat401RefreshesTokenAndRetriesSameAccount(t *testing.T) {
+	var chatCalls, refreshCalls int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+				refreshCalls++
+				return jsonHTTPResp(200, `{"code":0,"data":{"accessToken":"fresh","refreshToken":"rt2","expiresIn":3600}}`), nil
+			}
+			chatCalls++
+			if r.Header.Get("Authorization") == "Bearer at1" {
+				// 旧 token 被上游网关拒绝（openresty HTML 页，无业务信封）。
+				return jsonHTTPResp(401, `<html><head><title>401 Authorization Required</title></head><body><center><h1>401 Authorization Required</h1></center><hr><center>openresty</center></body></html>`), nil
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s（刷新后重试应成功）", rec.Code, rec.Body)
+	}
+	if refreshCalls != 1 {
+		t.Errorf("refreshCalls=%d want 1（401 应触发一次强制刷新）", refreshCalls)
+	}
+	if chatCalls != 2 {
+		t.Errorf("chatCalls=%d want 2（401 一次 + 刷新后重试一次）", chatCalls)
+	}
+	st, _ := p.Status("u1")
+	if st.Disabled {
+		t.Errorf("刷新成功后不应禁用: %+v", st)
+	}
+	// 关键：401 不得喂连败计数（旧行为会推进连败降权）。
+	if st.ConsecutiveFails != 0 {
+		t.Errorf("consecutive_fails=%d want 0（401 是已知原因，不喂连败降权）", st.ConsecutiveFails)
+	}
+	if !st.DegradeUntil.IsZero() {
+		t.Errorf("degrade_until=%v want 零值（401 不应触发降权）", st.DegradeUntil)
+	}
+}
+
+// TestChat401DisablesWhenRefreshFails 刷新也失败（refreshToken 同样失效）→ 禁用该号，
+// 且**不**喂连败计数（终态惩罚已足够，重复计罚会污染降权口径）。
+func TestChat401DisablesWhenRefreshFails(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+				return jsonHTTPResp(401, `{"code":9999,"msg":"bad token"}`), nil
+			}
+			return jsonHTTPResp(401, `<html><body>401 Authorization Required</body></html>`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if rec.Code != 503 {
+		t.Errorf("code=%d want 503", rec.Code)
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled {
+		t.Fatalf("刷新失败应禁用: %+v", st)
+	}
+	if !strings.Contains(st.DisabledReason, "401") {
+		t.Errorf("disabled_reason=%q want 含 401（运维要能看出是凭据被拒）", st.DisabledReason)
+	}
+	if st.ConsecutiveFails != 0 {
+		t.Errorf("consecutive_fails=%d want 0（不重复计罚）", st.ConsecutiveFails)
+	}
+}
+
+// TestChat401RefreshRetriedOnceOnly 刷新"成功"但上游仍 401 时，同一请求内不得反复
+// 刷新刷上游（每次请求最多一次强制刷新）。
+func TestChat401RefreshRetriedOnceOnly(t *testing.T) {
+	var refreshCalls int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+				refreshCalls++
+				return jsonHTTPResp(200, `{"code":0,"data":{"accessToken":"fresh","expiresIn":3600}}`), nil
+			}
+			// 无论 token 是什么都 401（模拟账号被风控，刷新也救不活）。
+			return jsonHTTPResp(401, `Unauthorized`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+
+	if refreshCalls != 1 {
+		t.Errorf("refreshCalls=%d want 1（每次请求最多一次强制刷新）", refreshCalls)
+	}
+	if st, _ := p.Status("u1"); !st.Disabled {
+		t.Errorf("刷新后仍 401 应禁用: %+v", st)
+	}
+}
+
+// jsonHTTPResp 构造 JSON 响应（带 Content-Type）。
+func jsonHTTPResp(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
 func TestChatTransportErrorDoesNotPenalize(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	up := &upstream.Client{

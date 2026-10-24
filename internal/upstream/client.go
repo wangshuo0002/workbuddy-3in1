@@ -42,6 +42,7 @@ const (
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
+	ErrUnauthorized                  // 401 凭据被上游网关拒绝（无 12153 标记）→ 先强制刷新，失败则禁用
 )
 
 func (k ErrKind) String() string {
@@ -72,6 +73,8 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrClient:
 		return "client"
+	case ErrUnauthorized:
+		return "unauthorized"
 	default:
 		return "none"
 	}
@@ -485,6 +488,8 @@ func ParseRateReset(body string) (time.Time, bool) {
 //  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
+//  4. 401 —— 凭据被上游拒绝（无 12153 标记）：归 ErrUnauthorized（先强制刷新、
+//     失败再禁用），不得落入通用 4xx 兜底的 ErrClient（连败计数会误伤好号）。
 //  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
@@ -511,6 +516,15 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault
 		}
+	}
+	// 401 凭据被拒（未带 12153 session-dead 标记）：APISIX/openresty 网关的
+	// "401 Authorization Required" HTML 页、或信封形 {"code":9999,"msg":"bad token"}。
+	// 语义是「这把 access token 上游不认了」——不是账号健康问题，更不是「未知 4xx」：
+	// 落到 ErrClient 会喂连败计数（NoteFailures），5 连败即触发连败降权把好号踢出池，
+	// 而真实病因只是 token 该刷新了。判在 429/限流层之前：401 的限流文案（网关错误页
+	// 混排）不改变「凭据被拒」这一更权威的事实；真 session 死亡已被上方 12153 层捕获。
+	if status == http.StatusUnauthorized {
+		return ErrUnauthorized
 	}
 	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
 	// 可自愈的软限流并在全池冷却时反复兜底选中（issue #175）。仅按结构化 code
@@ -896,6 +910,38 @@ const refreshIOTimeout = 30 * time.Second
 // 实测 R-D 响应恒 5184000=60d）。超限视为上游脏数据，不写 ExpiresAt（保留旧值），
 // 防止 NeedsRefresh 永假导致 token 永不刷新反而真过期失效。
 const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
+
+// IsUnauthorized 报告 err 是否为上游 401（凭据被拒，ErrUnauthorized）。
+// 401 的语义是「上游不认这把 access token」——常见于 token 被轮换/风控作废，
+// 或账号 realm 与请求的 base 域不匹配（global 号打 CN 域）。与 12153 session
+// dead 不同：后者要人工重登，前者刷一次 token 多半能自愈。
+func IsUnauthorized(err error) bool {
+	var ue *Error
+	return errors.As(err, &ue) && ue.Kind == ErrUnauthorized
+}
+
+// WithTokenRefreshRetry 在 fn 返回 401（ErrUnauthorized）时强制刷新 token 并重试一次。
+//
+// 为什么需要：计费/余额/签到这类低频维护调用没有 chat 的换号轮转语义——token 被
+// 上游作废后，周期任务（balance 每 5 分钟一轮）会一直拿同一个死 token 打同一端点，
+// 日志里只剩刷屏的 401，账号永远不恢复。401 只有刷新能治，故在此收敛为「刷新 + 重试
+// 一次」：成功即自愈，失败把刷新原因一并带出（刷新也被拒 = 真需人工重登）。
+// 只对 401 生效：429/5xx 等已有各自的冷却/重试策略，不得在此叠加。
+func (c *Client) WithTokenRefreshRetry(a *auth.Auth, fn func() error) error {
+	err := fn()
+	if !IsUnauthorized(err) {
+		return err
+	}
+	if rerr := c.RefreshToken(a); rerr != nil {
+		return fmt.Errorf("%w (token refresh failed: %v)", err, rerr)
+	}
+	if serr := a.SaveAtomic(); serr != nil {
+		// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露（不阻断本次重试）。
+		log.Printf("WARN: [upstream] 401 refresh %s: save auth failed: %v", logfmt.Label(a.UID, a.Nickname), serr)
+	}
+	log.Printf("WARN: [upstream] 401 %s: token force-refreshed, retrying", logfmt.Label(a.UID, a.Nickname))
+	return fn()
+}
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
@@ -1954,11 +2000,15 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 	}
 	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
+	// 401 另走「强制刷新 token + 重试一次」：周期余额任务没有 chat 的换号轮转，
+	// token 被上游作废后会一直拿死 token 打同一端点（日志只剩刷屏 401）。
 	var data json.RawMessage
-	err = c.retryBillingTransient(func() error {
-		var e error
-		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
-		return e
+	err = c.WithTokenRefreshRetry(a, func() error {
+		return c.retryBillingTransient(func() error {
+			var e error
+			data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+			return e
+		})
 	})
 	if err != nil {
 		return 0, 0, 0, time.Time{}, 0, err
@@ -2064,10 +2114,13 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
+// 401 走强制刷新 token + 重试一次（同 user-resource，理由见 WithTokenRefreshRetry）。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-		return err
+	return c.WithTokenRefreshRetry(a, func() error {
+		return c.retryBillingTransient(func() error {
+			_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+			return err
+		})
 	})
 }
 

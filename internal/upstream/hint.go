@@ -57,6 +57,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
 	case ErrSessionDead:
 		return "account session expired at upstream; the account is disabled until re-login"
+	case ErrUnauthorized:
+		// 401 是凭据被拒（不是账号健康/额度问题）：网关已尝试强制刷新一次 token，
+		// 刷新失败才禁用。客户端动作是「换号重试或重新登录」，不是等限流窗口。
+		return "upstream rejected the account credentials (401); the gateway refreshed the token, re-login may be required"
 	case ErrHardCredit:
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
 	case ErrModelBlocked:
