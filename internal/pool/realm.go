@@ -47,7 +47,10 @@ func (p *Pool) availableUIDsForScope(realm, provider string) []string {
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
-	return uids
+	// 人工优先级分层：与 pick 同口径裁剪到最高层（全池未设时原样返回）。
+	// 这里也过滤的理由：本方法供面板「按上游挑一个号去拉模型目录」等场景使用，
+	// 挑到低优先级号会让人误以为优先级不生效。
+	return p.filterUIDsByPriorityLocked(uids)
 }
 
 // WeightedAvailableUIDsForModelRealm 返回带虚拟实例权重的可用账号列表。
@@ -88,6 +91,19 @@ func (p *Pool) weightedAvailableUIDsForScope(model, realm, provider string) []st
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
+	// 人工优先级分层：新会话的哈希分配池先裁到最高层。
+	//
+	// 为什么粘性分配也必须过滤：会话一旦绑定就在 TTL 内不迁移（默认 30m 滚动续期），
+	// 若把新会话分给低优先级号，「优先用高权号」对长期对话型客户端会彻底失效——
+	// 高权号只在会话过期后才有机会被选到。
+	//
+	// 副作用（刻意接受）：本列表同时是粘性快路径的**命中校验集**（session.availableSet），
+	// 因此调高某号的优先级后，原先绑定在低优先级号上的会话会在下一次请求时重新分配。
+	// 这与「该号冷却/占满时解绑重分配」是同一套既有机制，代价是那一次请求失去上游
+	// prompt 缓存命中；换来的是设置优先级立即生效，而不是等 30 分钟会话过期。
+	// 调低/清除优先级不会反向迁移（低权号不再在候选集里，但已有绑定仍然合法，
+	// 因为清除优先级后所有账号同层、全部回到候选集）。
+	uids = p.filterUIDsByPriorityLocked(uids)
 
 	out := make([]string, 0, len(uids))
 	for _, uid := range uids {
@@ -136,5 +152,6 @@ func (p *Pool) availableUIDsForModelScope(model, realm, provider string) []strin
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
-	return uids
+	// 人工优先级分层：与 pick / 粘性分配池同口径（全池未设时原样返回）。
+	return p.filterUIDsByPriorityLocked(uids)
 }

@@ -12,6 +12,7 @@ package panel
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -208,6 +209,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
+	// 人工优先级（0 = 清除，恢复默认规则；1..100 越大越优先）。
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/priority", p.withAuth(p.accountPriority))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -817,6 +820,36 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.Disable(uid, "manual disable (panel)")
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountPriority 设置账号人工优先级（0 = 清除，恢复既有选号规则）。
+//
+// 请求体 {"priority": N}，N 钳到 [0, pool.PriorityMax]——越界按可纠正输入处理
+// （999 → 100），而不是让整次请求失败：一次手误不该变成一次排障。
+// 立即生效，不需重启：priority 只参与选号过滤，不进任何冷却/熔断状态机。
+func (p *Panel) accountPriority(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	var body struct {
+		Priority int `json:"priority"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+			return
+		}
+	}
+	if !p.cfg.Pool.SetPriority(uid, body.Priority) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	// 回读生效值（钳位后的结果），让前端不必自己再钳一次。
+	eff, _ := p.cfg.Pool.Priority(uid)
+	log.Printf("panel: priority uid=%s → %d（0=默认规则）", uid, eff)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "priority": eff, "max": pool.PriorityMax})
 }
 
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），

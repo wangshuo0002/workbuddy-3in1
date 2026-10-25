@@ -112,6 +112,9 @@ type Status struct {
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
 	ConsecutiveFails int       `json:"consecutive_fails"`
 	DegradeUntil     time.Time `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
+	// Priority 人工优先级层（1..PriorityMax，0 = 未设置）。面板据此渲染权重 chip；
+	// 零值也透出（同 ConsecutiveFails 口径：字段缺失会让人以为"没记录"）。
+	Priority int `json:"priority"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
@@ -252,6 +255,11 @@ type entry struct {
 	// 持久化（stateAccount.ModelCosts，P1-anti-monopoly）：重启后成本知识保留；
 	// 落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活。
 	modelCost map[string]modelCostEntry
+	// priority 人工优先级层（1..PriorityMax，0 = 未设置）。选号时先把候选裁剪到
+	// 最高优先级层，层内仍走既有加权抽签——「谁权重最高优先用谁」，而不是
+	// "高权号多拿几倍流量"。0 是零回归值：全池都不设时选号行为与引入前逐位一致。
+	// 持久化（stateAccount.Priority）：人工偏好跨重启保留，与 credits 同源落盘。
+	priority int
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
 }
@@ -474,6 +482,10 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// Priority 人工优先级层（见 entry.priority）。0 = 未设置，omitempty 省略——
+	// 存量 state.json 不带该键，加载后即 0（零回归）。越界值在恢复侧钳到
+	// [0, PriorityMax]：手改 state.json 写坏一个数字不该让整池选号失效。
+	Priority int `json:"priority,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态

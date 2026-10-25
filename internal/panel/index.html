@@ -257,6 +257,27 @@ td.cred em.cunit, .cred em.cunit { font-style: normal; color: var(--ink-3); font
 .prov-workbuddy { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 22%, transparent); }
 .prov-trae { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 26%, transparent); }
 .prov-zcode { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 26%, transparent); }
+/* 人工优先级 chip：状态列里紧跟「可用/冷却」标签的小徽标，本身是按钮。
+   未设置时用极淡的中性色（.off），设了才上强调色——默认不抢视线，
+   需要时一眼能找到入口；复用 realm-tag 的几何，与账号行内其他徽标同款。 */
+.pri-chip {
+  display: inline-flex; align-items: center; gap: 3px; margin-left: 6px;
+  padding: 1px 7px; border-radius: 999px; cursor: pointer;
+  font: 600 11px/1.5 var(--mono); font-variant-numeric: tabular-nums;
+  color: var(--accent); background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+  vertical-align: 1px; transition: border-color .12s, background .12s;
+}
+.pri-chip:hover { border-color: var(--accent); }
+.pri-chip.off {
+  color: var(--ink-3); background: transparent; border-style: dashed;
+  border-color: var(--line); font-weight: 500;
+}
+.pri-chip.off:hover { color: var(--accent); border-color: var(--accent); border-style: solid; }
+/* 优先级编辑弹窗：预设按钮排一行，数字输入窄一点，避免看起来像表单页。 */
+.pri-presets { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 10px; }
+.pri-presets button { padding: 4px 11px; font-size: 12.5px; }
+.pri-hint { font-size: 11.5px; color: var(--ink-3); margin-top: 12px; line-height: 1.6; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
@@ -1184,6 +1205,36 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <pre id="logBox"></pre>
       </div>
     </section>
+  </div>
+</div>
+
+<!-- 账号优先级 -->
+<div class="veil" id="priVeil">
+  <div class="dlg" style="width:460px">
+    <header>
+      <h3>账号优先级 <span class="hint" id="priWho"></span></h3>
+      <div class="hint">数字越大越优先。只要更高一档还有可用账号，请求就只会在那一档里挑；
+        同档内仍按积分与闲置度加权，不会把流量压在单号上。设为 0 = 恢复默认规则。</div>
+    </header>
+    <div class="body">
+      <label class="fld">
+        <span class="lb">优先级（0 – 100）</span>
+        <input type="number" id="priInput" min="0" max="100" step="1" value="0" autocomplete="off">
+        <span class="hint">0 = 未设置，参与默认的加权轮换</span>
+      </label>
+      <div class="pri-presets">
+        <button type="button" class="xs" data-p="0">清除（默认）</button>
+        <button type="button" class="xs" data-p="50">50 · 备选</button>
+        <button type="button" class="xs" data-p="80">80 · 常用</button>
+        <button type="button" class="xs" data-p="100">100 · 主力</button>
+      </div>
+      <div class="pri-hint" id="priNote"></div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnPriCancel">取消</button>
+      <button class="primary" id="btnPriSave">保存</button>
+    </footer>
   </div>
 </div>
 

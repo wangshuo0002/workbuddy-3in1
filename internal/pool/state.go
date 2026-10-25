@@ -322,7 +322,8 @@ func (p *Pool) AvailableUIDs() []string {
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
-	return uids
+	// 人工优先级分层：粘性分配池只留最高层（全池未设时原样返回，零回归）。
+	return p.filterUIDsByPriorityLocked(uids)
 }
 
 // AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
@@ -343,7 +344,8 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
-	return uids
+	// 人工优先级分层：与 AvailableUIDs 同口径（全池未设时原样返回）。
+	return p.filterUIDsByPriorityLocked(uids)
 }
 
 // PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
@@ -541,6 +543,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		ModelCosts:               p.modelCostsStatusLocked(e, now),
 		ConsecutiveFails:         e.consecutiveFails,
 		DegradeUntil:             e.degradeUntil,
+		Priority:                 e.priority,
 		InFlight:                 int(e.inFlight.Load()),
 		BreakerFails:             e.fails,
 		BreakerUntil:             e.breakerUntil,

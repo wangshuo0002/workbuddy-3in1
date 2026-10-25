@@ -94,6 +94,15 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm, provider string) *au
 		// provider 必须与 realm 一起下传：兜底是选号路径，串号防线在它这里同样不能缺。
 		return p.pickEarliestExpiryLocked(tried, now, realm, provider, reqModel)
 	}
+	// 人工优先级分层（「谁权重最高优先用谁」）：把候选裁剪到最高优先级层，层内
+	// 继续走下面的成本分层 + Top5 + 加权抽签。放在成本分层**之前**是刻意的——
+	// 优先级表达的是"我想让这个号先上"，不该被成本观测（tier 0/1/2）反过来否决；
+	// 反过来若放在之后，一个设了优先级但当前 tier 2 的号会被免费号挤掉，
+	// 用户会认为「设了优先级没用」。
+	// 全池都不设优先级时 filterByPriority 原样返回入参 → 后续逻辑逐位不变（零回归）。
+	// 溢出语义：最高层全部冷却/占满/触底 → cands 为空走上面的兜底；部分不可用
+	// 则在 healthy 过滤阶段已被剔除，本层剩几个就用几个。
+	cands = filterByPriority(cands)
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
 	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
 	// 峰值统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与抽签权重
@@ -334,6 +343,16 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, provider, model string) *auth.Auth {
 	var best *entry
+	// bestPriority 兜底路径同样尊重人工优先级：全冷却时优先捞「最高优先级层」里
+	// 最早到期的那个，而不是跨层取全池最早到期者。
+	//
+	// 为什么兜底也要看优先级：兜底的语义是"没有健康号时挑最可能已恢复的号试探"。
+	// 若设了优先级的号正在冷却，而低优先级号恰好更早到期，按全池最早取会把请求
+	// 发给低权号——用户看到的仍是「设了优先级没用」。反过来只在最高层内取最早，
+	// 语义一致：这一档恢复了就先用这一档。
+	// 零回归：全池都不设优先级时 bestPriority 恒 0、所有候选 priority 都是 0，
+	// 比较器退化为原来的「取最早到期」，结果逐位相同。
+	bestPriority := -1
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -359,6 +378,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		exp := e.expiry(now)
 		if exp.IsZero() {
 			continue
+		}
+		// 分层比较：优先级更高者无条件胜出；同层才比到期时间。
+		if e.priority > bestPriority {
+			best, bestPriority = e, e.priority
+			continue
+		}
+		if e.priority < bestPriority {
+			continue // 低优先级层：即便更早到期也不参与
 		}
 		if best == nil || exp.Before(best.expiry(now)) {
 			best = e

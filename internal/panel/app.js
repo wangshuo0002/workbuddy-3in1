@@ -392,6 +392,16 @@ function renderAccounts(list) {
       const kind = CK[s.cool_kind] || '限流冷却';
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    // 人工优先级 chip：紧跟状态标签，本身是按钮（点开编辑弹窗）。
+    // 设了才用强调色，未设置时是极淡的虚线「+权重」——默认不抢视线，但入口可发现。
+    // 文案用 P80 这种紧凑形态而不是「权重 80」：状态列本来就窄，且同档数字比长词好扫。
+    const pri = s.priority || 0;
+    const priChip = '<button type="button" class="pri-chip' + (pri > 0 ? '' : ' off') + '"' +
+      ' data-a="priority" data-u="' + esc(s.uid) + '"' +
+      ' title="' + (pri > 0
+        ? '人工优先级 P' + pri + '（数字越大越优先；同档内仍按余额/闲置加权）· 点击修改'
+        : '未设人工优先级：按默认规则选号 · 点击设为优先') + '">' +
+      (pri > 0 ? 'P' + pri : '+权重') + '</button>';
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
@@ -430,7 +440,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + provTag + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
+      '<td>' + tag + priChip + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -517,6 +527,9 @@ $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
+  // 优先级是「打开弹窗」而不是「立即执行」：放在 disabled/重渲染之前，
+  // 避免按钮被禁用后弹窗还没打开就被 loadOverview 重建掉。
+  if (a === 'priority') { openPriority(u); return; }
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
   if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
   b.disabled = true;
@@ -542,6 +555,55 @@ $('accBody').addEventListener('click', async ev => {
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
 });
+
+/* ── 账号人工优先级 ────────────────────────────────────────────────
+   语义：分层而非倍数。设了 P80 的号只要还有可用实例，请求就只在 P80 那一档里挑；
+   该档全部冷却/占满/触底才落到下一档。同档内仍走既有加权抽签（积分 + 闲置补偿），
+   所以「优先」不会变成「全部流量压在单号上」。
+   未设置（0）的账号完全沿用原规则——全池都不设时行为与引入前一致。 */
+let priUID = null;
+
+function priOf(uid) {
+  const acc = ((overviewData || {}).accounts || []).find(a => a.uid === uid);
+  return (acc && acc.priority) || 0;
+}
+
+function openPriority(uid) {
+  priUID = uid;
+  const cur = priOf(uid);
+  $('priWho').textContent = uid.slice(0, 16) + (cur > 0 ? ' · 当前 P' + cur : ' · 未设置');
+  $('priInput').value = cur;
+  $('priNote').textContent = cur > 0
+    ? '该号当前为 P' + cur + '。清除后立刻回到默认的加权轮换。'
+    : '默认规则：成本分层 → 积分/闲置加权 → Top5 抽签。设了优先级后会先按档位分层。';
+  $('priVeil').classList.add('on');
+  setTimeout(() => $('priInput').select(), 60);
+}
+function closePriority() { $('priVeil').classList.remove('on'); priUID = null; }
+
+$('btnPriCancel').onclick = closePriority;
+$('priVeil').addEventListener('click', ev => { if (ev.target === $('priVeil')) closePriority(); });
+document.querySelectorAll('#priVeil .pri-presets button').forEach(b => {
+  b.onclick = () => { $('priInput').value = b.dataset.p; $('priInput').focus(); };
+});
+$('btnPriSave').onclick = async () => {
+  if (!priUID) return;
+  // 前端也钳一次（与后端 clampPriority 同口径）：负数/超限/NaN 都归到合法值，
+  // 避免用户看到"保存成功但值变了"的困惑。
+  let n = Math.round(Number($('priInput').value));
+  if (!Number.isFinite(n) || n < 0) n = 0;
+  if (n > 100) n = 100;
+  const btn = $('btnPriSave');
+  btn.disabled = true; btn.textContent = '保存中…';
+  try {
+    const r = await api('accounts/' + encodeURIComponent(priUID) + '/priority', {
+      method: 'POST', body: JSON.stringify({ priority: n }),
+    });
+    toast(r.priority > 0 ? '已设为 P' + r.priority : '已恢复默认规则', 'ok');
+    closePriority();
+  } catch (e) { toast(e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '保存'; loadOverview(true); }
+};
 
 $('btnCheckinAll').onclick = async () => {
   try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
