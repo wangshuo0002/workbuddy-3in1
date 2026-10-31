@@ -517,17 +517,17 @@ func (a *creditAcc) finish() CreditAgg {
 
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
-	Totals          Agg         `json:"totals"`
-	ByProvider      []KeyedAgg  `json:"by_provider"`
-	ByRealm         []KeyedAgg  `json:"by_realm"`
-	ByAccount       []KeyedAgg  `json:"by_account"`
-	ByModel         []KeyedAgg  `json:"by_model"`
-	Series          []Point     `json:"series"`
-	CreditByAccount []CreditAgg `json:"credit_by_account"`
-	CreditByModel   []CreditAgg `json:"credit_by_model"`
-	Buckets         int         `json:"buckets"`
-	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	Totals           Agg         `json:"totals"`
+	ByProvider       []KeyedAgg  `json:"by_provider"`
+	ByRealm          []KeyedAgg  `json:"by_realm"`
+	ByAccount        []KeyedAgg  `json:"by_account"`
+	ByModel          []KeyedAgg  `json:"by_model"`
+	Series           []Point     `json:"series"`
+	CreditByAccount  []CreditAgg `json:"credit_by_account"`
+	CreditByModel    []CreditAgg `json:"credit_by_model"`
+	Buckets          int         `json:"buckets"`
+	FileBytes        int64       `json:"file_bytes"`
+	Since            string      `json:"since,omitempty"`
 	// WindowFrom/WindowTo 本次实际生效的统计区间（本地时间，RFC3339），供面板
 	// 回显口径——「自定义」区间下用户必须能确认服务端到底按哪段算的。
 	// 空串 = 该侧不设界（全部历史 / 到今天为止）。
@@ -741,7 +741,7 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		ByAccount: keyed(acctAgg, func(k string) (string, string) {
 			return k, nicks[k]
 		}),
-		ByModel:         keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		ByModel:          keyed(modelAgg, func(k string) (string, string) { return k, "" }),
 		CreditByAccount: creditKeyed(creditAcctAgg),
 		CreditByModel:   creditKeyed(creditModelAgg),
 		Buckets:         matched,

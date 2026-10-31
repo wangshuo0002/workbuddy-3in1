@@ -51,7 +51,22 @@ type ChatRequest struct {
 	OutputConfig json.RawMessage `json:"output_config,omitempty"`
 }
 
-// Chat 发起一次 Anthropic Messages 请求（/api/v1/zcode-plan/anthropic/v1/messages）。
+// Chat 发起一次 Anthropic Messages 请求。
+//
+// 【路由决策：凭证形态 → 端点 + 鉴权头】三处独立实现（D3-vin/Zcode2Api
+// upstream.ts buildAuthHeaders、liu5269/zcode2api agent.py build_request、
+// TriDefender/zcode-api upstream.ts）给出完全一致的三分表：
+//
+//	有 JWT（start-plan）      → zcode.z.ai/.../zcode-plan/anthropic/v1/messages
+//	                            Authorization: Bearer <jwt>
+//	有 API Key（coding-plan） → open.bigmodel.cn/api/anthropic/v1/messages
+//	                            Authorization: Bearer <key>  （同时可带 x-api-key）
+//	两者都有                  → **优先 JWT**（它是主通道，API Key 只是换钥产物）
+//
+// 旧实现的判定是 `useBigModel := c.a.APIKeyValue() != ""`，于是「面板登录的
+// JWT 账号」（Mode=jwt 但带 api_key 用于签名）会被错误地路由到 bigmodel 端点，
+// 同时只发 JWT 作为 Bearer —— bigmodel 不认 zcodejwt，必然
+// 401「身份验证失败」。这正是线上一直复现的 401。
 //
 // verifyParam 为阿里云无痕验证参数（可为空）；
 // extra 为需要透传或叠加的头部。
@@ -63,9 +78,10 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, verifyParam string,
 	if err != nil {
 		return nil, err
 	}
-	// 配了 BigModel/GLM 的 API Key（形如 "<id>.<secret>"）时直连 open.bigmodel.cn：
-	// 那条端点只认 key，不需要 zcode-plan 的 JWT + 客户端签名头。
-	useBigModel := c.a.APIKeyValue() != ""
+	// 端点与鉴权头由同一处决定，避免「选 A 端点配 B 鉴权」这类错配。
+	jwt := c.a.TokenValue()
+	apiKey := c.a.APIKeyValue()
+	useBigModel := jwt == "" && apiKey != ""
 	endpoint := c.baseURL + PathChat
 	if useBigModel {
 		endpoint = BaseURLBigModel + PathChatBigModel
@@ -81,6 +97,8 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, verifyParam string,
 		c.commonHeaders(h)
 		c.authHeader(h)
 		h.Set("X-ZCode-Agent", "glm")
+		// trace trio 只属于对话面（billing/monitor 不带），且必须每请求重新生成。
+		c.traceHeaders(h)
 	}
 	h.Set("Content-Type", "application/json")
 	h.Set("anthropic-version", "2023-06-01")
@@ -95,7 +113,12 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, verifyParam string,
 	for k, vs := range extra {
 		lk := strings.ToLower(k)
 		if lk == "authorization" || lk == "x-api-key" || lk == "content-type" ||
-			lk == "content-length" || lk == "host" || lk == "accept-encoding" {
+			lk == "content-length" || lk == "host" || lk == "accept-encoding" ||
+			// trace trio 由本函数生成：客户端的同名头若透传进来会覆盖掉，
+			// 导致多请求共用同一 trace → 被上游判为重放。
+			lk == "x-request-id" || lk == "x-zcode-trace-id" || lk == "x-zcode-session-type" ||
+			// 3012 的两个直接触发器，任何来源都不许带上游。
+			lk == "x-session-id" || lk == "x-query-id" {
 			continue
 		}
 		for _, v := range vs {
@@ -112,11 +135,14 @@ func (c *Client) Chat(ctx context.Context, req *ChatRequest, verifyParam string,
 			if session == "" {
 				session = c.a.UID
 			}
+			// 签名协议本身要求 X-Session-Id（payload 里有它），这里由
+			// SignRequest 写入 —— 与「start-plan 不该带 x-session-id」不矛盾：
+			// 带签名 = coding-plan 通道，它的协议就是需要；不带签名 = start-plan
+			// 通道，必须不带。
 			_ = sg.SignRequest(ctx, httpReq, session, c.appVer)
 		}
-	} else if sid := c.a.SessionID; sid != "" {
-		h.Set("X-Session-Id", sid)
 	}
+	// 无签名时不发 X-Session-Id（旧实现会发，这是 3012 的直接触发器之一）。
 	resp, err := c.hc.Do(httpReq)
 	if err != nil {
 		return nil, err

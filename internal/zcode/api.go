@@ -179,6 +179,16 @@ func derivedDeviceMid(seed string) string {
 }
 
 // commonHeaders 写入 ZCode 客户端通用头。
+//
+// 【为什么必须与官方客户端逐字段对齐】上游对「非官方客户端」的判定不只看签名：
+// 头部矩阵本身就是指纹。两处独立实现（D3-vin/Zcode2Api internal/upstream/chatheaders.go、
+// liu5269/zcode2api app/agent.py）交叉验证出同一条结论：
+//
+//	x-query-id / x-session-id 绝不能出现在 start-plan(JWT) 请求里 ——
+//	带上会直接触发上游 3012「unusual activity」。
+//
+// 而 trace trio（x-request-id / x-zcode-session-type / x-zcode-trace-id）必须**每请求
+// 重新生成**：固定值会被当成重放。
 func (c *Client) commonHeaders(h http.Header) {
 	h.Set("Accept", "application/json")
 	h.Set("X-Client-Language", "zh-CN")
@@ -189,7 +199,17 @@ func (c *Client) commonHeaders(h http.Header) {
 	h.Set("X-Platform", "win32-x64")
 	h.Set("X-Os-Category", "windows")
 	h.Set("X-Title", "Z Code@win32-x64")
-	h.Set("X-Device-Mid", c.deviceMid())
+	h.Set("X-Device-Mid", c.effectiveDeviceMid())
+}
+
+// traceHeaders 写入 trace trio（每请求重新生成）。
+//
+// 为什么单列一个函数：它只属于**对话**请求，billing/monitor 不该带
+// （控制面请求的 header 集合与 LLM 面不同，混用会被判异常）。
+func (c *Client) traceHeaders(h http.Header) {
+	h.Set("x-request-id", randomHex(16))
+	h.Set("x-zcode-session-type", "main")
+	h.Set("x-zcode-trace-id", randomHex(16))
 }
 
 // bigModelHeaders writes headers for the BigModel Anthropic-compatible endpoint.
@@ -202,15 +222,30 @@ func (c *Client) bigModelHeaders(h http.Header) {
 	}
 }
 
+// authHeader 写入上游鉴权头。
+//
+// 【JWT 与 API Key 是两个互斥的通道，不能同时发】
+//
+//	JWT（start-plan）  → Authorization: Bearer <jwt>
+//	API Key（coding-plan）→ x-api-key: <keyId>.<secret>
+//
+// 旧实现在 ModeAPIKey 时发 x-api-key、否则发 Authorization，看似正确，
+// 但漏掉了一个关键事实：**面板登录的账号 Mode 恒为 jwt，同时可能带 api_key
+// （用于签名/换钥）**。此时 Chat() 会因为 APIKeyValue() 非空而走 bigmodel 分支，
+// 而 bigmodel 分支又只发 Authorization —— 于是「有 api_key 的 JWT 账号」实际
+// 在用 JWT 打 bigmodel 端点，必然 401「身份验证失败」。
+//
+// 现在由 Chat() 按「凭证形态」决定走哪个端点 + 哪个鉴权头，本函数只负责
+// 写对应的那一个，不再根据 Mode 猜。
 func (c *Client) authHeader(h http.Header) {
-	if c.a.Mode == auth.ModeAPIKey {
-		if k := c.a.APIKeyValue(); k != "" {
-			h.Set("x-api-key", k)
-		}
-		return
-	}
+	// 有 JWT 就用 JWT（start-plan 主通道）。
 	if t := c.a.TokenValue(); t != "" {
 		h.Set("Authorization", "Bearer "+t)
+		return
+	}
+	// 无 JWT 才回落 API Key（纯 api_key 账号）。
+	if k := c.a.APIKeyValue(); k != "" {
+		h.Set("x-api-key", k)
 	}
 }
 

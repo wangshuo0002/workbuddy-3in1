@@ -17,6 +17,7 @@ import (
 	"github.com/jjjane233/workbuddy-3in1/internal/pool"
 	"github.com/jjjane233/workbuddy-3in1/internal/reqlog"
 	"github.com/jjjane233/workbuddy-3in1/internal/trae"
+	"github.com/jjjane233/workbuddy-3in1/internal/upstream"
 	"github.com/jjjane233/workbuddy-3in1/internal/zcode"
 )
 
@@ -173,7 +174,14 @@ func (h *Handler) chatZCodeUpstream(w http.ResponseWriter, r *http.Request, req 
 }
 
 func (h *Handler) tryZCodeOnce(ctx context.Context, a *auth.Auth, req *OAIRequest, model string, incoming http.Header) (*upstreamResult, error) {
-	cli := zcode.New(a, zcode.Options{Timeout: 5 * time.Minute})
+	// 客户端与上游共用的 HTTP 客户端（Config.UpstreamHTTP 的注释明确写了它服务
+	// Trae/ZCode 链路）。此前漏传，导致：无视部署方配置的出口代理、无法在测试里
+	// 注入假上游、超时口径与 Trae 链路脱节。
+	cli := zcode.New(a, zcode.Options{
+		Timeout:     5 * time.Minute,
+		HTTPClient:  h.cfg.UpstreamHTTP,
+		MonitorHost: zcodeMonitorHostFor(a),
+	})
 
 	var verifyParam string
 	if h.cfg.Captcha != nil {
@@ -189,74 +197,102 @@ func (h *Handler) tryZCodeOnce(ctx context.Context, a *auth.Auth, req *OAIReques
 		h.noteUpstreamSoft(a.UID, "zcode chat error: "+err.Error())
 		return nil, err
 	}
-	// zcode.z.ai 的 zcode-plan 对话端点会对非官方客户端回 405 + 3012
-	// 「unusual activity」，且与签名/模型/头部无关（2026-10-06 全矩阵实测）。
-	// 此时别把 3012 直接甩给用户：改用同一把凭据走 BigModel/Z.AI 的
-	// Anthropic 端点（实测 200 出正文），并记录是哪条通路成功的。
-	if resp.StatusCode == http.StatusMethodNotAllowed || resp.StatusCode == http.StatusNotAcceptable {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		resp.Body.Close()
-		if zcode.IsBlocked(string(body)) {
-			if key := zcodeFallbackKey(a); key != "" {
-				if alt, aerr := cli.ChatViaKey(ctx, creq, key, a.Source == "zai"); aerr == nil && alt != nil {
-					h.noteUpstreamSoft(a.UID, "zcode 3012 -> anthropic fallback ok")
-					return h.finishZCodeResponse(ctx, a, req, creq, alt), nil
-				} else if aerr != nil {
-					h.noteUpstreamSoft(a.UID, "zcode 3012 fallback failed: "+aerr.Error())
-				}
-			}
-		}
-		return &upstreamResult{retry: true, errMsg: "zcode 405 blocked: " + truncate(string(body), 200)}, nil
-	}
 
-	switch resp.StatusCode {
-	case http.StatusOK:
+	// ---- 统一分类 ----
+	//
+	// 旧实现按 status 逐分支处置，后果是「四类完全不同的问题塌缩成两句话」：
+	//   额度耗尽 / 并发超限 / 验证码失效 / 指纹被拦 → 全被当成「429 限流」或「401 未授权」，
+	// 且都去冷却账号（其中两类根本不该罚号，冷却只会让可用号变少）。
+	// 现在一次读完 body、交给 zcode.Classify 归类，再按类处置。
+	//
+	// 200 直接放行，不做任何 body 预读（流式响应不能被消费）。
+	if resp.StatusCode == http.StatusOK {
 		h.cfg.Pool.NoteSuccess(a.UID)
-	case http.StatusUnauthorized:
-		h.noteUpstreamHard(a.UID, "401 未授权")
-		resp.Body.Close()
-		return &upstreamResult{retry: true, errMsg: "zcode 401 unauthorized"}, nil
-	case http.StatusPaymentRequired:
-		h.noteUpstreamHard(a.UID, "402 额度不足")
-		resp.Body.Close()
-		return &upstreamResult{retry: true, errMsg: "zcode 402 insufficient"}, nil
-	case http.StatusForbidden:
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		resp.Body.Close()
-		b := string(body)
-		if zcode.IsCaptchaError(b) {
-			if h.cfg.Captcha != nil {
-				h.cfg.Captcha.Invalidate()
-			}
-			return &upstreamResult{retry: true, errMsg: "zcode captcha rejected"}, nil
+		if req.Stream {
+			return &upstreamResult{streaming: true, stream: resp.Body}, nil
 		}
-		h.noteUpstreamHard(a.UID, "403 拒绝")
-		return &upstreamResult{retry: true, errMsg: "zcode 403: " + truncate(b, 200)}, nil
-	case http.StatusNotAcceptable:
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 		resp.Body.Close()
-		h.noteUpstreamSoft(a.UID, "405 需客户端签名")
-		return &upstreamResult{retry: true, errMsg: "zcode 405 blocked: " + truncate(string(body), 200)}, nil
-	case http.StatusTooManyRequests:
-		h.noteUpstreamSoft(a.UID, "429 限流")
-		resp.Body.Close()
-		return &upstreamResult{retry: true, errMsg: "zcode 429 rate limited"}, nil
+		return &upstreamResult{status: http.StatusOK, body: body, usage: usageFromZCodeBody(body)}, nil
 	}
 
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		resp.Body.Close()
-		h.cfg.Pool.NoteError(a.UID)
-		return &upstreamResult{retry: true,
-			errMsg: fmt.Sprintf("zcode http %d: %s", resp.StatusCode, truncate(string(body), 200))}, nil
-	}
-
-	if req.Stream {
-		return &upstreamResult{streaming: true, stream: resp.Body}, nil
-	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	// 非 200：读一次 body（上限 8KB），后面所有分支共用，且原文进日志/错误信息。
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	resp.Body.Close()
-	return &upstreamResult{status: http.StatusOK, body: body, usage: usageFromZCodeBody(body)}, nil
+	b := string(body)
+	detail := truncate(strings.TrimSpace(b), 300)
+	verdict := zcode.Classify(resp.StatusCode, body)
+
+	// 3012/3009 指纹拦截：先尝试换到 BigModel/Z.AI 的 Anthropic 端点（同一把凭据），
+	// 成功就当作成功——这条回落链路旧实现只在 405/406 时试，而实际拦截也常以 403 出现。
+	if verdict == zcode.VerdictLoadBlocked {
+		if key := zcodeFallbackKey(a); key != "" {
+			if alt, aerr := cli.ChatViaKey(ctx, creq, key, a.Source == "zai"); aerr == nil && alt != nil {
+				// 回退成功 = 账号完全可用。**只记日志，不碰冷却**：
+				// 旧代码在这里调 noteUpstreamSoft("fallback ok")，等于每次成功回退
+				// 都把好号罚 600s——成功路径给自己上冷却，是纯 bug。
+				logUpstream("zcode %s: %s -> anthropic fallback ok", a.Display(), verdict)
+				return h.finishZCodeResponse(ctx, a, req, creq, alt), nil
+			} else if aerr != nil {
+				logUpstream("zcode %s: %s fallback failed: %v", a.Display(), verdict, aerr)
+			}
+		}
+	}
+
+	switch verdict {
+	case zcode.VerdictQuotaExhausted:
+		// 额度耗尽：**按模型标死 + 换号**，不冷却账号。
+		// 与「限流」的本质区别：等一会儿重试没用，要等周期重置；而账号对其他模型
+		// 仍可能可用，所以只能标 (账号, 模型) 而不是整号。
+		h.cfg.Pool.BlockModelBackoff(a.UID, model, "zcode quota exhausted")
+		return &upstreamResult{retry: true,
+			errMsg: "zcode quota exhausted (" + verdict.String() + "): " + detail}, nil
+
+	case zcode.VerdictAdmissionLimit:
+		// 准入并发上限（3010）：账号健康、额度充足，只是该模型在途太多。
+		// 官方客户端是「等 1s，再等 2s，同账号重试」——这里简化为短退避后换号，
+		// 因为网关的换号成本远低于客户端等待，且能立刻找到空闲号。
+		h.noteUpstreamSoft(a.UID, "3010 准入并发上限: "+detail)
+		return &upstreamResult{retry: true, errMsg: "zcode 3010 admission limit: " + detail}, nil
+
+	case zcode.VerdictCaptcha:
+		// 人机验证失效：作废缓存，下次请求重取。**不罚号**（账号没问题）。
+		if h.cfg.Captcha != nil {
+			h.cfg.Captcha.Invalidate()
+		}
+		return &upstreamResult{retry: true, errMsg: "zcode captcha rejected: " + detail}, nil
+
+	case zcode.VerdictPlanLacksModel:
+		// 套餐不含该模型：长期避让 (账号, 模型)，换号可能有效（别的号套餐不同）。
+		h.cfg.Pool.BlockModelBackoff(a.UID, model, "zcode plan lacks model")
+		return &upstreamResult{retry: true,
+			errMsg: "zcode plan lacks model (" + verdict.String() + "): " + detail}, nil
+
+	case zcode.VerdictUnauthorized:
+		// 凭据被拒——这才是真的需要换凭证/重登。
+		// 保留上游原文：三种成因（JWT 过期 / secret 轮换后失效 / 端点选错）处置完全不同，
+		// 旧实现丢 body 只留一句「401 未授权」，线上完全无法定位。
+		h.noteUpstreamHard(a.UID, "401 未授权: "+detail)
+		return &upstreamResult{retry: true, errMsg: "zcode 401 unauthorized: " + detail}, nil
+
+	case zcode.VerdictRateLimited:
+		// 普通限流：跟随 Retry-After（与 CodeBuddy 链路同口径），没有才回落软冷却基数。
+		reason := "429 限流"
+		if detail != "" {
+			reason += ": " + detail
+		}
+		if d, ok := upstream.ParseRetryAfter(resp.Header); ok {
+			h.cfg.Pool.CooldownSoftRate(a.UID, h.softCooldown(), time.Now().Add(d), reason)
+		} else {
+			h.noteUpstreamSoft(a.UID, reason)
+		}
+		return &upstreamResult{retry: true, errMsg: "zcode 429 rate limited: " + detail}, nil
+	}
+
+	// 未分类（4xx/5xx 其他）：喂熔断计数，原文透传。
+	h.cfg.Pool.NoteError(a.UID)
+	return &upstreamResult{retry: true,
+		errMsg: fmt.Sprintf("zcode http %d: %s", resp.StatusCode, detail)}, nil
 }
 
 // zcodeFallbackKey 返回可用于 BigModel / Z.AI Anthropic 端点的 key。
