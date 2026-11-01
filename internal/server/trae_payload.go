@@ -12,16 +12,40 @@ import (
 // 从 gw2api/internal/server/trae_payload.go 平移：OpenAI 请求 → Trae IDE 私有协议请求体。
 
 // chanReader 将字符串通道适配为 io.ReadCloser（供 SSE 透传）。
+//
+// Close 必须真的生效：上游流被收流（正常结束 / stop 命中 / 客户端断开）后，
+// 读循环已经不会再从 channel 取数据，若 goroutine 还在往里塞，它就会永久
+// 阻塞在发送上（channel 缓冲满后），连接也就跟着泄漏。closed 让 Read 立即
+// 返回 EOF，Close 之后不阻塞。
 type chanReader struct {
 	ch   <-chan string
 	err  <-chan error
 	buf  []byte
 	once sync.Once
+	mu   sync.Mutex
+	done chan struct{} // 惰性创建；Close 时关闭 → Read 立即 EOF
+}
+
+// doneCh 返回（必要时创建）关闭信号 channel。
+func (r *chanReader) doneCh() chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done == nil {
+		r.done = make(chan struct{})
+	}
+	return r.done
 }
 
 func (r *chanReader) Read(p []byte) (int, error) {
+	done := r.doneCh()
 	for len(r.buf) == 0 {
-		v, ok := <-r.ch
+		var v string
+		var ok bool
+		select {
+		case <-done:
+			return 0, io.EOF
+		case v, ok = <-r.ch:
+		}
 		if !ok {
 			select {
 			case e := <-r.err:
@@ -46,7 +70,7 @@ func (r *chanReader) Read(p []byte) (int, error) {
 }
 
 func (r *chanReader) Close() error {
-	r.once.Do(func() {})
+	r.once.Do(func() { close(r.doneCh()) })
 	return nil
 }
 
@@ -123,7 +147,7 @@ func buildTraePayload(req *OAIRequest, model string) []byte {
 	// 历史里已有工具结果时，追加一条硬指令。Trae 上游对标记的遵循率不稳定，
 	// 不加这句时模型会重复调用同一工具（实测 T2 偶发重复），形成调用环。
 	if toolPrompt != "" && hasToolResult(req.Messages) {
-		toolPrompt += "\n\n注意：上面的工具已经执行完毕，结果已在对话中给出。你必须直接依据结果给出最终自然语言回答，严禁再次输出任何 " + traeFnBegin + " 标记。"
+		toolPrompt += traeNoRepeatDirective
 	}
 	hist := make([]map[string]any, 0, len(req.Messages))
 	var systemPrompt string
@@ -362,7 +386,7 @@ func buildSoloPayload(req *OAIRequest, model string) []byte {
 	// 历史里已有工具结果时追加硬指令：上游对标记的遵循率不稳定，不加这句
 	// 模型会重复调用同一工具，形成调用环（/chat 链实测 T2 偶发重复）。
 	if toolPrompt != "" && hasToolResult(req.Messages) {
-		toolPrompt += "\n\n注意：上面的工具已经执行完毕，结果已在对话中给出。你必须直接依据结果给出最终自然语言回答，严禁再次输出任何 " + traeFnBegin + " 标记。"
+		toolPrompt += traeNoRepeatDirective
 	}
 
 	messages := make([]map[string]any, 0, len(req.Messages))

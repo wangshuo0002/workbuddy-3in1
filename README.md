@@ -125,8 +125,12 @@ provider 别名：`zcode` / `zai` / `bigmodel` → ZCode；`trae` / `traecode` �
 | **对话** | `POST /api/ide/v1/chat`（SSE）。`buildTraePayload` 把 OpenAI messages 压成上游的 `chat_history` + `user_input` + `intent_name=general_qa_intent`；`stream` 恒 true |
 | **内置模型（DLL）链** | 另一条独立链路 `/api/agent/v3/llm_utils_chat`，独立头矩阵（`X-Uid` / `X-Ide-Token` / `X-Ide-Version` / `X-Ide-Version-Code` / `Request-Traffic-Type` 等），缺头即 400 / 401 |
 | **模型目录** | 内置 **35 条**（客户端 `state.vscdb` 的 7 个 section 合并 + 4 条上游仍认的老平台模型）；实时可用集来自 `model_list?type=chat` 与 `get_detail_param`，含倍率、折扣率、上下文、最大输出、多模态、工具能力、思考档位 |
-| **工具调用** | 上游会**静默忽略** `tools` 字段，因此改为「提示词注入 + `<\|FunctionCallBegin\|>…<\|FunctionCallEnd\|>` 内联标记」，响应侧用跨帧 hold-back 状态机解析回标准 OpenAI `tool_calls` 增量帧 |
+| **工具调用** | 上游会**静默忽略** `tools` 字段，因此改为「提示词注入 + 内联标记」，响应侧用跨帧 hold-back 状态机解析回标准 OpenAI `tool_calls` 增量帧。**同时兼容两种标记格式**：约定的 `<\|FunctionCallBegin\|>`，以及 DeepSeek 系模型的**原生 DSML**（`<\|DSML\|tool_calls>` / `<\|DSML\|invoke>` / `<\|DSML\|parameter>`，含 `<‖DSML‖>` 双竖线变体）——不认后者时整段 XML 会当正文吐给用户。解析器还容忍 CDATA 包装、字符串化 arguments；参数非法 JSON 的调用整条作废（不把脏参数丢给客户端） |
+| **多轮工具链** | 历史里已有工具结果时只注入「不要重复调用**同一个**工具」，**不是**「禁止再调工具」——后者会让 agent 第 1 次调用后永久禁言，任务草草收尾（现象：回复只有一两句） |
 | **流式解析** | `event: output` → `data.response`（正文）/ `data.reasoning_content`（思考链）；`event: token_usage` → usage；`progress_notice` / `metadata` / `prompt` 控制帧丢弃（否则会把 `Building prompt: …` 当成正文吐给用户） |
+| **流式截断检测** | 上游在**没有 `event: done`** 的情况下结束（被掐 `sc.Err() != nil`，或上游"干净 EOF"直接关流）时不再谎报 `finish_reason=stop`，改报 `length` 并把该请求记为 `stream_error` + WARN 日志（含上游事件序列）；有工具调用时保留 `tool_calls`。`event: done` 之后仍继续收残帧（有界 64 行 / 2s） |
+| **静默期保活** | 上游出字前可能整分钟只发 `progress_notice`（Building prompt）。网关现在①**首帧立即写出并 flush**；②静默期每 10s 发一个合法空 `delta` 帧。否则客户端空闲看门狗会判"响应停滞"并主动取消（现象：客户端显示"已取消 / 用户已取消"，用量 `0 tok`）。③上游连续 3 分钟无任何帧则取消请求并按中断收尾 |
+| **UTF-8 边界安全** | 两层 hold-back（`traeFnParser` 保留 19 字节、`stopMatcher` 保留 `len(stop)-1` 字节）按字节算切点，中文正文会被劈成半个汉字 → `json.Marshal` 转成 `\ufffd` 显示成乱码。所有切点现在统一经 `utf8SafeCut` 回退到字符边界（最多多 hold 3 字节） |
 | **排队自动换号** | 预读首段响应，命中 `queue` / `waiting` / `排队` 等字样立即换号重试 |
 | **积分折算** | Trae 响应**不含积分字段**，按实测双系数 `a·prompt + b·completion` 估算，写入池与用量账本（面板显示 `≈`） |
 | **token 刷新** | `POST /trae/api/v3/oauth/ExchangeToken`，请求体走 **ECDSA-P256 签名**（`DeviceProof`），过期时间为毫秒；请求前按 10 分钟 margin 预刷新并落盘 |
@@ -460,6 +464,7 @@ curl -s http://127.0.0.1:7863/v1/chat/completions \
 | **多账号共用同一设备指纹** | `x-app-id` / `x-device-brand` / `x-device-type` / `x-os-version` 是全局常量，只有 `x-device-id` 按账号取值（缺省回落 UID）。同池多号在风控侧可能被关联 |
 | **积分是估算值，不是真值** | Trae 响应里**没有**积分字段，网关按 `a·prompt + b·completion` 双系数折算（面板标 `≈`）。系数表按模型档位维护，新模型落到兜底档位时会有偏差 |
 | **流式没有 usage，思考链被丢弃** | SSE 收流没有 usage 帧，流式用量只能靠本地估算；`reasoning_content` **只在非流式响应**里保留（流式无标准槽位） |
+| **上游会中途掐流** | 长回答（尤其中途插入工具调用时）偶尔上游直接断连、不给 `event: done`。网关现在把它标成 `finish_reason=length` + `stream_error`，但**无法恢复已丢的内容**——只能靠调用方按 length 语义续写。日志里 `events=[...]` 会列出上游实际发过的事件名，用于区分「上游只发 progress 就关流」与「上游发了 output 但被网关判成控制帧」 |
 | **工具调用不是原生 tools** | 上游会静默忽略 `tools`，只能用"提示词注入 + `<\|FunctionCallBegin\|>…<\|FunctionCallEnd\|>` 内联标记 + 跨帧状态机回译"。模型不按约定输出就丢工具调用；官方改提示词模板也会导致漂移 |
 | **排队换号靠关键字匹配** | 预读首段命中 `queue` / `waiting` / `排队` 等字样才换号。上游改文案即失效（不会报错，只会继续等） |
 | **登录必须自备回环中继** | 授权页硬校验 `127.0.0.1:<port>/authorize`，服务器部署无法直接登录。中继脚本**内嵌面板 api_key**、需要开机自启，轮换 key 后必须重装，且脚本不可外发 |

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"strings"
+	"unicode/utf8"
 )
 
 // 网关侧的 stop 序列支持。
@@ -87,7 +88,7 @@ func (m *stopMatcher) feed(chunk string) (emit string, hit bool) {
 		m.held = buf
 		return "", false
 	}
-	cut := len(buf) - keep
+	cut := utf8SafeCut(buf, len(buf)-keep)
 	out := buf[:cut]
 	m.held = buf[cut:]
 	return out, false
@@ -109,6 +110,26 @@ func truncateAtStop(text string, stops []string) (string, bool) {
 		return text[:i], true
 	}
 	return text, false
+}
+
+// utf8SafeCut 把按**字节**算出的切点回退到 UTF-8 字符边界。
+//
+// hold-back 的保留量按字节算（标记是 ASCII，keep = len(marker)-1），但被 hold
+// 的正文常常是中文：切点落在某个多字节字符中间时，前半段就是非法 UTF-8，
+// 经 json.Marshal 编码成 \ufffd 之后客户端看到的就是一片乱码
+// （实测：`我是小王一跑在���王这台机器上`）。宁可多 hold 最多 3 个字节，
+// 也不能把字符劈开。
+func utf8SafeCut(s string, cut int) int {
+	if cut <= 0 {
+		return 0
+	}
+	if cut >= len(s) {
+		return len(s)
+	}
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return cut
 }
 
 // parseStopSequences 解析请求体里的 OpenAI stop 字段：字符串或字符串数组都认，

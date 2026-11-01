@@ -71,12 +71,18 @@ func (c *Client) SoloChatStream(ctx context.Context, body []byte, extraHeaders m
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if strings.HasPrefix(line, "data:") || strings.HasPrefix(line, "event:") {
-				dataCh <- line
-			}
 			if ctx.Err() != nil {
 				return
+			}
+			line := strings.TrimSpace(sc.Text())
+			if strings.HasPrefix(line, "data:") || strings.HasPrefix(line, "event:") {
+				// 发送必须可被取消：下游提前收流后没人再读 dataCh，
+				// 裸发送会让本 goroutine 永久阻塞（连接随之泄漏）。
+				select {
+				case dataCh <- line:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
 		if err := sc.Err(); err != nil && ctx.Err() == nil {

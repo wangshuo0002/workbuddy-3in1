@@ -9,9 +9,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jjjane233/workbuddy-3in1/internal/auth"
 	"github.com/jjjane233/workbuddy-3in1/internal/pool"
@@ -53,6 +56,13 @@ type upstreamResult struct {
 	// cancel 释放本次 Trae 上游请求的 context。排队预检命中时立即调用，
 	// 避免上游连接继续占用账号并发槽。
 	cancel context.CancelFunc
+	// interrupted 上游流在**未发出收尾帧**的情况下提前结束（EOF / 读错误 /
+	// 未收到 event: done）。此时客户端已经收到 200 与部分正文，无法重试，
+	// 唯一正确做法是把「流被截断」明确告知客户端并记为流错误——
+	// 旧实现对此一无所知，仍写出 finish_reason=stop + [DONE]，于是客户端把
+	// 半截回答当成正常完成（面板显示「已完成」但内容停在半句），
+	// 这也是「对话没输出完就停止」最隐蔽的一条成因。
+	interrupted bool
 }
 
 // ---- 池与冷却适配层 ----
@@ -538,7 +548,12 @@ func (h *Handler) chatTraeUpstream(w http.ResponseWriter, r *http.Request, req *
 		h.recordUpstreamUsage(acct, model, u, time.Since(started), true)
 		st.noteStreamUsage(u, "stop")
 		st.status = http.StatusOK
+		// 上游提前断流时不能记成功：面板上要能看出「这次回答是残缺的」，
+		// 否则用户只能看到账号正常、用量正常，却找不到任何异常痕迹。
 		st.outcome = reqlog.OutcomeSuccess
+		if res.interrupted {
+			st.outcome = reqlog.OutcomeStreamError
+		}
 		return
 	}
 	// 错误分类（与 traecode2api 口径一致）：模型不存在 / 权益不足要给出可诊断的
@@ -580,7 +595,13 @@ func isTraeEntitlementError(msg string) bool {
 
 func (h *Handler) tryTraeOnce(ctx context.Context, a *auth.Auth, req *OAIRequest, model string, raw []byte) (*upstreamResult, error) {
 	attemptCtx, cancel := context.WithCancel(ctx)
-	cli := trae.New(a, trae.Options{})
+	// 与 ZCode 链路对齐：共用部署方配置的上游客户端（出口代理 / 超时口径一致），
+	// 并让测试可以注入假上游。此前漏传导致 Trae 只能走自建 transport。
+	var hopts trae.Options
+	if h.cfg.UpstreamHTTP != nil {
+		hopts.HTTPClient = h.cfg.UpstreamHTTP
+	}
+	cli := trae.New(a, hopts)
 	// 凭证过期则先换票（ExchangeToken 滚动刷新），失败不阻断——上游会用 401 回我们。
 	_ = cli.EnsureFreshToken(attemptCtx, a, 10*time.Minute)
 	// DLL 内置模型（glm-5.3-flashx / deepseek-v4.1-flash / step-5-preview 等）
@@ -732,6 +753,44 @@ func traeDelta(data string) (content, reasoning string, ok bool) {
 	return content, reasoning, true
 }
 
+// traePostDoneDrainLines event: done 之后最多继续读多少行。
+//
+// 旧实现见到 done 立刻收流：上游把长回答分成多个 output 帧时，只要 done 早到
+// 一帧，剩下的正文就整段丢掉（观感「回答写到一半停了」）。但也不能无脑读到 EOF
+// ——上游可能带着心跳把连接留住，客户端会一直等。故给有界窗口：done 之后的
+// 残帧照收，行数到顶或超过 traePostDoneGrace 未结束即收流。
+const traePostDoneDrainLines = 64
+
+// traePostDoneGrace done 之后等待残帧的最长时间，超时即取消上游请求。
+// 正常残帧是紧随 done 到达的，几百毫秒就够；给到 2s 是为了容忍上行拥塞，
+// 同时避免 upstream 挂住连接时把客户端一起拖死。
+const traePostDoneGrace = 2 * time.Second
+
+// traeKeepAliveInterval 网关向客户端发送「空心跳帧」的间隔。
+//
+// Trae 上游在真正出字之前可能长时间只发 progress_notice（实测「Building
+// prompt」阶段能持续 1~2 分钟）。此期间网关一个字节都不写，客户端的空闲
+// 看门狗会判定「响应停滞」并主动取消（Trae 客户端显示「已取消」、
+// WorkBuddy 客户端显示「用户已取消」，用量 0 tok）——用户看到的就是
+// 「话还没说完就停了」。
+//
+// 心跳用**合法的 OpenAI 空 delta 帧**而不是 SSE 注释（": keep-alive"）：
+// 注释行虽符合 SSE 规范，但不少 OpenAI 兼容客户端会把它当成畸形帧。
+//
+// 变量而非常量：测试需要把窗口缩短到毫秒级才能验证保活行为。
+var traeKeepAliveInterval = 10 * time.Second
+
+// traeUpstreamIdleCap 上游连续多久没有任何帧就判定为「假死」并主动取消。
+//
+// 心跳只解决「客户端不取消」，解决不了「上游永不回应」：若上游挂住连接，
+// 客户端会一直收到心跳、一直转圈，用户等不到任何回答也等不到错误。
+// 超过该上限即取消上游请求（Read 立刻返回），按中断收尾并上报 length。
+var traeUpstreamIdleCap = 3 * time.Minute
+
+// traeInterruptedTotal 累计观测到的「上游提前断流」次数（进程内计数）。
+// 用于线上判断该现象是偶发还是常态；日志里与单次请求的中断明细一起看。
+var traeInterruptedTotal atomic.Int64
+
 // streamTraeUpstream 将 Trae 的 SSE 数据帧转换为 OpenAI SSE。
 // 返回本次流观测到的 usage（上游在 event: token_usage 帧里给计数）。
 //
@@ -741,8 +800,21 @@ func traeDelta(data string) (content, reasoning string, ok bool) {
 //	                 没有思考链的标准槽位，塞进 content 会让正文混入思维过程）
 //	token_usage    → 取计数，不进正文
 //	error          → 把上游错误文案附在正文并收流
-//	done           → 立即收流（不等连接关闭，避免客户端卡在最后一帧）
+//	done           → 标记已收尾，继续吃掉紧随其后的残帧（有界），随后收流
 //	其余（progress_notice / metadata / prompt）→ 纯控制帧，一律丢弃
+//
+// 三条「不能停」的保护：
+//
+//  1. **首帧立即下发**：上游首个 output 可能几十秒后才到，网关先把 role 帧
+//     写出去并 flush，客户端的 TTFB 看门狗就不会误判。
+//  2. **空闲心跳**：等待期每 traeKeepAliveInterval 写一个空 delta 帧，
+//     避免客户端「响应停滞 → 取消」（截图上「已取消 / 用量 0 tok」的成因）。
+//  3. **上游假死上限**：连续 traeUpstreamIdleCap 无任何帧即取消上游请求。
+//
+// 退出原因决定 finish_reason：正常收尾为 stop / tool_calls；上游在**没有 done
+// 帧**的情况下结束（连接被掐 sc.Err() != nil，或上游「干净 EOF」直接关闭流）
+// 则为 length，并把 res.interrupted 置位。这一点是「任务没完成、输出没写完
+// 就停」的关键：旧实现一律上报 stop，客户端于是把半截回答当成正常完成。
 func (h *Handler) streamTraeUpstream(w http.ResponseWriter, res *upstreamResult, model string, stops []string) upstreamUsage {
 	defer res.stream.Close()
 	flusher := startOpenAIStream(w)
@@ -755,12 +827,138 @@ func (h *Handler) streamTraeUpstream(w http.ResponseWriter, res *upstreamResult,
 	// Trae 的工具调用是内联标记文本，先剥离再进 stop 匹配（标记不该出现在正文里）。
 	fnp := newTraeFnParser()
 	var toolCalls []oaiToolCall
+	emittedLen := 0 // 已吐出正文的字节数（仅用于日志与「有没有输出」判定）
+	// writeChunk 发一帧并立即 flush。所有写出都必须走它：不 flush 的字节
+	// 会滞留在缓冲里，客户端的空闲看门狗看到的仍是「没有响应」。
+	writeChunk := func(delta *OAIDelta, finish *string) {
+		writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
+			Choices: []OAIChoice{{Index: 0, Delta: delta, FinishReason: finish}}})
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	emit := func(s string) {
+		if s == "" {
+			return
+		}
+		emittedLen += len(s)
+		writeChunk(&OAIDelta{Role: roleOnce(&sentRole), Content: s}, nil)
+	}
+
+	// 首帧：立刻把 role 帧写出去。上游在「Building prompt」阶段可能整分钟
+	// 不发 output，客户端在此期间收不到任何字节就会超时取消。
+	writeChunk(&OAIDelta{Role: roleOnce(&sentRole)}, nil)
+
 	sc := bufio.NewScanner(res.stream)
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	pendingEvent := ""
-	stop := false
-	for !stop && sc.Scan() {
-		line := sc.Text()
+	stop := false    // 硬停（error 帧 / stop 命中）
+	sawDone := false // 收到 event: done
+	sawError := false
+	sawOutput := false // 收到过 output 帧（判定「上游到底有没有开始回答」）
+	drain := 0
+	// seenEvents 记录上游发过的事件名序列（去重计数），仅用于「无输出就结束」
+	// 时的诊断日志：线上排查需要区分「上游只发 progress 就关流」与
+	// 「上游发了 output 但我们判成控制帧」这两种完全不同的成因。
+	var seenEvents []string
+	noteEvent := func(name string) {
+		if len(seenEvents) < 16 {
+			seenEvents = append(seenEvents, name)
+		}
+	}
+	// done 之后的看门狗：到点直接取消上游请求，让阻塞中的读立刻 EOF。
+	// （chanReader 的 Close 只是本地信号，真正解开 Read 要靠 RST 连接。）
+	var doneTimer *time.Timer
+	defer func() {
+		if doneTimer != nil {
+			doneTimer.Stop()
+		}
+	}()
+	armDoneTimer := func() {
+		if doneTimer != nil || res.cancel == nil {
+			return
+		}
+		doneTimer = time.AfterFunc(traePostDoneGrace, res.cancel)
+	}
+
+	// 行读取与「空闲保活 / 假死上限」并行：sc.Scan() 是阻塞的，等待期间
+	// 什么都不会写，因此心跳必须由另一条 goroutine 定时触发。
+	// 用 timer 而不是固定 ticker：每次真有帧到达就重置，避免一边正常出字
+	// 一边白发心跳。
+	//
+	// 退出协议：主线关闭 stopCh 后 goroutine 立即返回（不再阻塞在发送上）。
+	// 上游阻塞在 Scan 里时由 res.cancel() 打断——那正是「假死上限」的用法。
+	// sc 只允许由该 goroutine 触碰（含 sc.Err()），否则与之构成数据竞争。
+	type scanResult struct {
+		line string
+		err  error
+		done bool
+	}
+	lines := make(chan scanResult, 8)
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	var scanErr error
+	go func() {
+		defer close(lines)
+		for sc.Scan() {
+			select {
+			case lines <- scanResult{line: sc.Text()}:
+			case <-stopCh:
+				return
+			}
+		}
+		// Scan 结束：把读错误一并交出（sc 归本 goroutine 独占）。
+		err := sc.Err()
+		select {
+		case lines <- scanResult{err: err, done: true}:
+		case <-stopCh:
+		}
+	}()
+	idleTimer := time.NewTimer(traeKeepAliveInterval)
+	defer idleTimer.Stop()
+	lastActivity := time.Now()
+	for !stop {
+		var line string
+		select {
+		case r, ok := <-lines:
+			if !ok {
+				// channel 已关闭且没收到 done 标记：上游流结束。
+				stop = true
+				continue
+			}
+			if r.done {
+				scanErr = r.err
+				stop = true
+				continue
+			}
+			line = r.line
+			lastActivity = time.Now()
+			idleTimer.Reset(traeKeepAliveInterval)
+		case <-idleTimer.C:
+			// 上游这段时间没有新帧：给客户端发一个空 delta 保活，
+			// 同时检查上游是否已经假死到该放弃的程度。
+			if time.Since(lastActivity) >= traeUpstreamIdleCap {
+				log.Printf("WARN trae upstream idle %.0fs model=%s emitted=%dB; abort",
+					time.Since(lastActivity).Seconds(), model, emittedLen)
+				if res.cancel != nil {
+					res.cancel()
+				}
+				stop = true
+				continue
+			}
+			if !sawDone {
+				writeChunk(&OAIDelta{}, nil)
+			}
+			idleTimer.Reset(traeKeepAliveInterval)
+			continue
+		}
+		if sawDone {
+			drain++
+			if drain > traePostDoneDrainLines {
+				stop = true
+				continue
+			}
+		}
 		// event: 与 data: 成对出现；事件名先到，先暂存再与紧随的 data 配对。
 		if strings.HasPrefix(line, "event:") {
 			pendingEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
@@ -785,27 +983,31 @@ func (h *Handler) streamTraeUpstream(w http.ResponseWriter, res *upstreamResult,
 		}
 		name := pendingEvent
 		pendingEvent = ""
+		if name != "" {
+			noteEvent(name)
+		}
 		switch name {
 		case "done":
-			stop = true
+			// 不在这里收流：done 之后仍可能有 output 残帧（见 traePostDoneDrainLines）。
+			// 只给有界窗口，到点由看门狗取消上游请求。
+			sawDone = true
+			armDoneTimer()
 		case "error":
 			var e struct {
 				Message string `json:"message"`
 			}
 			_ = json.Unmarshal([]byte(data), &e)
 			if e.Message != "" {
-				writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-					Choices: []OAIChoice{{Index: 0, Delta: &OAIDelta{Role: roleOnce(&sentRole), Content: "\n[trae error] " + e.Message}}}})
-				if flusher != nil {
-					flusher.Flush()
-				}
+				emit("\n[trae error] " + e.Message)
 			}
+			sawError = true
 			stop = true
 		case "output":
 			raw, _, ok := traeDelta(data)
 			if !ok || raw == "" {
 				continue
 			}
+			sawOutput = true
 			// 先剥工具标记：命中则进 toolCalls，正文只剩标记之外的部分。
 			content, calls := fnp.feed(raw)
 			if len(calls) > 0 {
@@ -816,24 +1018,14 @@ func (h *Handler) streamTraeUpstream(w http.ResponseWriter, res *upstreamResult,
 			}
 			// stop 截断（Trae 私有协议没有 stop 字段，只能网关侧补）。
 			if matcher != nil {
-				emit, hit := matcher.feed(content)
-				if emit != "" {
-					writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []OAIChoice{{Index: 0, Delta: &OAIDelta{Role: roleOnce(&sentRole), Content: emit}}}})
-					if flusher != nil {
-						flusher.Flush()
-					}
-				}
+				out, hit := matcher.feed(content)
+				emit(out)
 				if hit {
 					stop = true
 				}
 				continue
 			}
-			writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-				Choices: []OAIChoice{{Index: 0, Delta: &OAIDelta{Role: roleOnce(&sentRole), Content: content}}}})
-			if flusher != nil {
-				flusher.Flush()
-			}
+			emit(content)
 		default:
 			// 控制帧（progress_notice / metadata / prompt / 心跳）不进正文。
 		}
@@ -845,33 +1037,49 @@ func (h *Handler) streamTraeUpstream(w http.ResponseWriter, res *upstreamResult,
 		}
 		if ftail != "" {
 			if matcher != nil {
-				emit, _ := matcher.feed(ftail)
-				if emit != "" {
-					writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-						Choices: []OAIChoice{{Index: 0, Delta: &OAIDelta{Role: roleOnce(&sentRole), Content: emit}}}})
-				}
+				out, _ := matcher.feed(ftail)
+				emit(out)
 			} else {
-				writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-					Choices: []OAIChoice{{Index: 0, Delta: &OAIDelta{Role: roleOnce(&sentRole), Content: ftail}}}})
+				emit(ftail)
 			}
 		}
 	}
 	if matcher != nil {
-		if tail := matcher.flush(); tail != "" {
-			writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-				Choices: []OAIChoice{{Index: 0, Delta: &OAIDelta{Role: roleOnce(&sentRole), Content: tail}}}})
-		}
+		emit(matcher.flush())
 	}
 	// 工具调用：OpenAI 规范的 tool_calls 增量帧，随后 finish_reason=tool_calls。
+	// index 用真实序号（parseTraeCalls 已按数组顺序写好），否则多工具会被客户端
+	// 当成同一个调用而互相覆盖。
 	if len(toolCalls) > 0 {
+		for i := range toolCalls {
+			idx := i
+			toolCalls[i].Index = &idx
+		}
 		emitToolCallChunks(w, flusher, id, model, created, &sentRole, toolCalls)
 	}
 	finish := "stop"
 	if len(toolCalls) > 0 {
 		finish = "tool_calls"
 	}
-	writeSSE(w, OAIChunk{ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-		Choices: []OAIChoice{{Index: 0, Delta: &OAIDelta{}, FinishReason: &finish}}})
+	// 中断判定：没收到 done / error 就结束了 —— 不论是被掐（sc.Err() != nil）
+	// 还是上游「干净 EOF」直接关流，都算残缺。
+	//
+	// 干净 EOF 这一支必须单独判：实测上游把连接正常关闭却从不下发 done 时
+	// sc.Err() 为 nil，旧判定漏掉它，于是照样上报 stop，客户端把半截回答
+	// 当成正常完成（截图症状）。
+	//
+	// 例外：已经拿到完整工具调用时保持 tool_calls——改报 length 会让客户端
+	// 丢掉这些调用并重试，比「正文少一截」代价更大。
+	if !sawDone && !sawError {
+		res.interrupted = true
+		traeInterruptedTotal.Add(1)
+		if finish != "tool_calls" {
+			finish = "length"
+		}
+		log.Printf("WARN trae stream ended without done model=%s emitted=%dB output_frames=%v tool_calls=%d finish=%s events=%v err=%v",
+			model, emittedLen, sawOutput, len(toolCalls), finish, seenEvents, scanErr)
+	}
+	writeChunk(&OAIDelta{}, &finish)
 	_, _ = io.WriteString(w, "data: [DONE]\n\n")
 	if flusher != nil {
 		flusher.Flush()
@@ -879,10 +1087,16 @@ func (h *Handler) streamTraeUpstream(w http.ResponseWriter, res *upstreamResult,
 	return got
 }
 
-// traeFinish 非流式收尾的 finish_reason：有 tool_calls 就是 tool_calls，否则 stop。
-func traeFinish(hasTools bool) string {
+// traeFinishFor 按「是否命中工具 / 流是否被上游提前掐断」给出 finish_reason。
+// 中断时优先 length（OpenAI 语义里 length 表示「还能继续、但这次到此为止」，
+// 客户端据此续写或重试；写成 stop 会让 agent 判定任务已完成并停下）。
+// 已拿到完整工具调用时仍报 tool_calls（客户端要按它去执行工具）。
+func traeFinishFor(hasTools, interrupted bool) string {
 	if hasTools {
 		return "tool_calls"
+	}
+	if interrupted {
+		return "length"
 	}
 	return "stop"
 }
@@ -892,6 +1106,10 @@ func traeFinish(hasTools bool) string {
 // 上游只有 SSE，而 OpenAI 的 stream:false 语义要求「一次 JSON、一次 usage」。
 // 网关在这里聚合（与 traecode2api 的 traeStream.collect 同口径），返回的
 // Content-Type 是 application/json，调用方可直接 json.Unmarshal。
+//
+// 与流式不同，非流式没有「中间帧」可发：客户端拿到的是一条完整 JSON，
+// HTTP 语义本身就允许服务端先思考再响应，故这里不做心跳（改动会破坏
+// 纯 JSON 契约）。上游假死由 tryTraeOnce 的请求 context 与传输层超时兜底。
 func (h *Handler) collectTraeUpstream(w http.ResponseWriter, res *upstreamResult, model string, stops []string) upstreamUsage {
 	defer res.stream.Close()
 	var content, reasoning strings.Builder
@@ -902,11 +1120,20 @@ func (h *Handler) collectTraeUpstream(w http.ResponseWriter, res *upstreamResult
 	var toolCalls []oaiToolCall
 	stopHit := false
 	errMsg := ""
+	sawDone := false
+	sawError := false
+	drain := 0
 	sc := bufio.NewScanner(res.stream)
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	pendingEvent := ""
 	stop := false
 	for !stop && sc.Scan() {
+		if sawDone {
+			drain++
+			if drain > traePostDoneDrainLines {
+				break
+			}
+		}
 		line := sc.Text()
 		if strings.HasPrefix(line, "event:") {
 			pendingEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
@@ -932,7 +1159,7 @@ func (h *Handler) collectTraeUpstream(w http.ResponseWriter, res *upstreamResult
 		pendingEvent = ""
 		switch name {
 		case "done":
-			stop = true
+			sawDone = true
 		case "error":
 			var e struct {
 				Message string `json:"message"`
@@ -940,6 +1167,7 @@ func (h *Handler) collectTraeUpstream(w http.ResponseWriter, res *upstreamResult
 			if json.Unmarshal([]byte(data), &e) == nil {
 				errMsg = e.Message
 			}
+			sawError = true
 			stop = true
 		case "output":
 			raw, r, ok := traeDelta(data)
@@ -990,6 +1218,15 @@ func (h *Handler) collectTraeUpstream(w http.ResponseWriter, res *upstreamResult
 	if matcher != nil && !stopHit {
 		content.WriteString(matcher.flush())
 	}
+	// 非流式同样不能虚报成功：上游没 done 也没 error 就结束（被掐或干净 EOF），
+	// 说明聚合到的是半截回答，finish_reason 用 length 并记 WARN。
+	interrupted := !sawDone && !sawError
+	if interrupted {
+		res.interrupted = true
+		traeInterruptedTotal.Add(1)
+		log.Printf("WARN trae collect interrupted model=%s collected=%dB tool_calls=%d err=%v",
+			model, content.Len(), len(toolCalls), sc.Err())
+	}
 	msg := map[string]any{"role": "assistant", "content": content.String()}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
@@ -1016,7 +1253,7 @@ func (h *Handler) collectTraeUpstream(w http.ResponseWriter, res *upstreamResult
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   model,
-		"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": traeFinish(len(toolCalls) > 0)}},
+		"choices": []any{map[string]any{"index": 0, "message": msg, "finish_reason": traeFinishFor(len(toolCalls) > 0, interrupted)}},
 		"usage": map[string]any{
 			"prompt_tokens":     prompt,
 			"completion_tokens": completion,
@@ -1129,6 +1366,10 @@ func errString(err error) string {
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// 回退到 UTF-8 字符边界：错误体/上游文案常含中文，按字节硬切会劈开汉字。
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }

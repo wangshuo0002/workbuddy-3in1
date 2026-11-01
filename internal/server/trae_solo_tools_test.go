@@ -130,15 +130,29 @@ func TestBuildSoloPayloadRendersToolHistory(t *testing.T) {
 }
 
 // TestBuildSoloPayloadKeepsToolResultHardInstruction 历史里已有工具结果时，
-// 工具说明必须追加「禁止再次输出标记」的硬指令，抑制重复调用的调用环。
+// 工具说明必须追加「不要重复调用**同一个**工具」的指令，抑制调用环。
+//
+// 语义变更（2026-11-01，用户反馈「话没说完就停了」）：
+//
+//	旧指令：「严禁再次输出任何 <|FunctionCallBegin|> 标记」
+//	新指令：「不要重复调用同一个工具；若还需要其它工具，可以继续调用」
+//
+// 旧写法的问题：只要历史里出现过**任意一条** role:"tool"，之后每一轮都被
+// 永久禁言。agent 场景是多轮工具链（读文件 → 改文件 → 跑测试 → 再改），
+// 第 1 次调用工具之后模型就再也不能调工具，只能草草收尾——表现就是
+// 「话没说完就停 / 只回一两句」。
 func TestBuildSoloPayloadKeepsToolResultHardInstruction(t *testing.T) {
 	got := buildSoloFromJSON(t, `{"messages":[`+
 		`{"role":"user","content":"weather?"},`+
 		`{"role":"tool","tool_call_id":"c1","content":"sunny"}`+
 		`],`+soloTools+`}`)
 	txt := soloFirstText(t, got, 0)
-	if !strings.Contains(txt, "严禁再次输出任何") {
-		t.Fatalf("已有工具结果时必须追加硬指令：\n%s", txt)
+	if !strings.Contains(txt, "不要重复调用") {
+		t.Fatalf("已有工具结果时必须追加防重复调用指令：\n%s", txt)
+	}
+	// 绝不能出现「禁止再调工具」的绝对禁令（会切断多轮工具链）。
+	if strings.Contains(txt, "严禁再次输出") {
+		t.Fatalf("不该禁止后续工具调用（会切断 agent 多轮链路）：\n%s", txt)
 	}
 }
 

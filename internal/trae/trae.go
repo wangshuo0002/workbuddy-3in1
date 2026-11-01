@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jjjane233/workbuddy-3in1/internal/auth"
 )
@@ -613,13 +614,19 @@ func (c *Client) ChatStream(ctx context.Context, body []byte, extraHeaders map[s
 			sc := bufio.NewScanner(resp.Body)
 			sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 			for sc.Scan() {
+				if ctx.Err() != nil {
+					return
+				}
 				line := strings.TrimSpace(sc.Text())
 				// 同时透传 event: 与 data: 两行，保持顺序让上层能按事件类型解析。
 				if strings.HasPrefix(line, "data:") || strings.HasPrefix(line, "event:") {
-					dataCh <- line
-				}
-				if ctx.Err() != nil {
-					return
+					// 发送必须可被取消：下游提前收流后没人再读 dataCh，
+					// 裸发送会让本 goroutine 永久阻塞（连接随之泄漏）。
+					select {
+					case dataCh <- line:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 			if err := sc.Err(); err != nil && ctx.Err() == nil {
@@ -635,7 +642,10 @@ func (c *Client) ChatStream(ctx context.Context, body []byte, extraHeaders map[s
 		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 		if len(raw) > 0 {
-			dataCh <- string(raw)
+			select {
+			case dataCh <- string(raw):
+			case <-ctx.Done():
+			}
 		}
 	}()
 	return dataCh, errCh, nil
@@ -661,6 +671,11 @@ func (c *Client) ModelList(ctx context.Context, typ string) (json.RawMessage, er
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// 按字节截断时回退到 UTF-8 字符边界：错误体里常含中文，
+	// 硬切会把汉字劈开，日志/响应里显示成乱码。
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n]
 }

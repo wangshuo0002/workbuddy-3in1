@@ -138,6 +138,140 @@ func TestParseTraeCallsSingleObject(t *testing.T) {
 	}
 }
 
+// TestTraeFnParserFlushKeepsUnclosedPayload 回归「flush 吞正文」：
+// 模型输出了 <|FunctionCallBegin|> 却**不是**在调工具（误发标记，载荷不像
+// JSON 调用）时，flush 必须把载荷当正文补发，不能整段丢弃。
+//
+// 反例（必须丢弃）见 TestTraeFnParserFlushDropsTruncatedCall：
+// 载荷是真工具调用（以 [ 或 { 开头）时绝不能当正文吐给用户。
+func TestTraeFnParserFlushKeepsUnclosedPayload(t *testing.T) {
+	p := newTraeFnParser()
+	if out, _ := p.feed("前面的正文" + traeFnBegin + `我先看一下目录结构`); out == "" {
+		t.Fatal("前面的正文应在 hold-back 之外被吐出")
+	}
+	tail, calls := p.flush()
+	if len(calls) != 0 {
+		t.Fatalf("残缺载荷不该被解析成调用: %#v", calls)
+	}
+	if tail != `我先看一下目录结构` {
+		t.Fatalf("误发标记后的正文应补发，实际 %q", tail)
+	}
+}
+
+// TestTraeFnParserFlushDropsTruncatedCall 真正被截断的工具调用（载荷以 [ 或
+// { 开头）**不能**当正文吐给用户。
+//
+// 这是线上回归：模型用 write 工具写一个大文件，参数字节数超过 hold 上限，
+// 旧实现把这段 JSON 当正文放行，客户端显示成
+// 「已调用工具 + 一大坨 {"name":"write","parameters":{...}}」。
+func TestTraeFnParserFlushDropsTruncatedCall(t *testing.T) {
+	for _, payload := range []string{
+		`[{"name":"get_wea`,
+		`{"name":"write","parameters":{"file_path":"D:\\a.py","content":"#!/usr/bin/env py`,
+	} {
+		p := newTraeFnParser()
+		p.feed(traeFnBegin + payload)
+		tail, calls := p.flush()
+		if len(calls) != 0 {
+			t.Fatalf("残缺载荷不该被解析成调用: %#v", calls)
+		}
+		if tail != "" {
+			t.Fatalf("截断的工具调用绝不能当正文吐出，实际 %q", tail)
+		}
+	}
+}
+
+// TestTraeFnParserFeedReleasesOverlongHold 模型误发未闭合标记时，
+// 后续正文不能被无限 hold（观感同样是「回答停了」）。
+// 但**仅当载荷不像调用时**才放行——见 TestTraeFnParserKeepsLargeCallPayload。
+func TestTraeFnParserFeedReleasesOverlongHold(t *testing.T) {
+	p := newTraeFnParser()
+	p.feed(traeFnBegin)
+	big := strings.Repeat("x", traeFnMaxHold+16)
+	out, calls := p.feed(big)
+	if len(calls) != 0 {
+		t.Fatalf("不该产出调用: %#v", calls)
+	}
+	if out != big {
+		t.Fatalf("超长且不像调用的载荷应整段放行，实际长度 %d", len(out))
+	}
+	if p.inCall {
+		t.Fatal("放行后应复位 inCall")
+	}
+}
+
+// TestTraeFnParserKeepsLargeCallPayload 大参数的工具调用必须完整解析。
+//
+// 线上回归：write 工具写整份源码（远超 traeFnMaxHold），旧实现按字节数
+// 把载荷当正文吐了出去。判定必须结合「像不像调用」，只看长度就会误放行。
+func TestTraeFnParserKeepsLargeCallPayload(t *testing.T) {
+	body := strings.Repeat("x", 64<<10) // 64KB 源码
+	payload := `[{"name":"write","parameters":{"file_path":"D:\\burp_mcp_bridge.py","content":"` + body + `"}}]`
+	p := newTraeFnParser()
+	var text strings.Builder
+	// 分 4KB 片喂入，模拟上游分帧。
+	raw := traeFnBegin + payload + traeFnEnd
+	for i := 0; i < len(raw); i += 4096 {
+		end := i + 4096
+		if end > len(raw) {
+			end = len(raw)
+		}
+		o, cs := p.feed(raw[i:end])
+		text.WriteString(o)
+		if len(cs) > 0 {
+			if len(cs) != 1 || cs[0].Function.Name != "write" {
+				t.Fatalf("bad calls: %#v", cs)
+			}
+			if len(cs[0].Function.Arguments) < 64<<10 {
+				t.Fatalf("参数被截断: %d 字节", len(cs[0].Function.Arguments))
+			}
+			if text.String() != "" {
+				t.Fatalf("工具调用不该泄漏进正文: %q", text.String())
+			}
+			return
+		}
+	}
+	t.Fatal("大参数工具调用未被解析出来")
+}
+
+// TestParseTraeCallsStripsCDATA 模型把载荷包进 CDATA 时必须能解析，
+// 否则客户端显示成「已调用工具 + <![CDATA[]]>」。
+func TestParseTraeCallsStripsCDATA(t *testing.T) {
+	for _, payload := range []string{
+		`<![CDATA[[{"name":"ops_bash","parameters":{"cmd":"ls"}}]]]>`,
+		`<![CDATA[{"name":"ops_bash","parameters":{"cmd":"ls"}}]]>`,
+	} {
+		cs := parseTraeCalls(payload)
+		if len(cs) != 1 || cs[0].Function.Name != "ops_bash" {
+			t.Fatalf("CDATA 载荷未解析: %q -> %#v", payload, cs)
+		}
+		if cs[0].Function.Arguments != `{"cmd":"ls"}` {
+			t.Fatalf("参数 = %q", cs[0].Function.Arguments)
+		}
+	}
+}
+
+// TestParseTraeCallsUnquotesStringifiedArgs 上游把 parameters 写成字符串化
+// JSON 时要解包，否则客户端拿到的是带转义的字符串而不是对象。
+func TestParseTraeCallsUnquotesStringifiedArgs(t *testing.T) {
+	cs := parseTraeCalls(`[{"name":"f","parameters":"{\"a\":1}"}]`)
+	if len(cs) != 1 {
+		t.Fatalf("未解析: %#v", cs)
+	}
+	if cs[0].Function.Arguments != `{"a":1}` {
+		t.Fatalf("参数未解包: %q", cs[0].Function.Arguments)
+	}
+}
+
+// TestParseTraeCallsDropsInvalidArgs 参数不是合法 JSON 时整条调用作废，
+// 而不是把脏参数丢给客户端（那会渲染成占位符）。
+func TestParseTraeCallsDropsInvalidArgs(t *testing.T) {
+	cs := parseTraeCalls(`[{"name":"f","parameters":not-json-at-all}]`)
+	if len(cs) != 0 {
+		t.Fatalf("非法参数应丢弃该调用: %#v", cs)
+	}
+}
+
 func TestToolChoiceIsNone(t *testing.T) {
 	if !toolChoiceIsNone(json.RawMessage("\"none\"")) {
 		t.Fatal("none not detected")

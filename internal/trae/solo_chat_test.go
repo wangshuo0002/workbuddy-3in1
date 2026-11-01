@@ -1,6 +1,7 @@
 package trae
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
@@ -27,7 +28,7 @@ func TestDetailParamUsesSoloHeaders(t *testing.T) {
 		}, nil
 	})}
 	a := &auth.Auth{AccessToken: "TOKEN", UID: "UID", DeviceID: "DEVICE"}
-	if _, err := New(a, Options{HTTPClient: hc}).DetailParam(t.Context()); err != nil {
+	if _, err := New(a, Options{HTTPClient: hc}).DetailParam(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got == nil {
